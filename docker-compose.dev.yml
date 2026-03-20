@@ -1,0 +1,63 @@
+# Development compose — builds the image locally instead of pulling from ghcr.io
+#
+# Manual run:  docker compose -f docker-compose.dev.yml run --rm bw-backup
+# Build only:  docker compose -f docker-compose.dev.yml build
+
+services:
+
+  bw-backup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BW_CLI_VERSION: "2026.1.0"
+    image: bitwarden-kdbx-backup:dev
+    container_name: bitwarden-kdbx-backup-dev
+    restart: "no"
+
+    environment:
+      BW_URL:             ${BW_URL}
+      BW_CLIENTID:        ${BW_CLIENTID}
+      BW_CLIENTSECRET:    ${BW_CLIENTSECRET}
+      BW_MASTER_PASSWORD: ${BW_MASTER_PASSWORD}
+      KEEPASS_PASSWORD:   ${KEEPASS_PASSWORD}
+      BACKUP_OUTPUT_DIR:  ${BACKUP_OUTPUT_DIR:-/backups}
+      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+      SMTP_HOST:          ${SMTP_HOST:-}
+      SMTP_PORT:          ${SMTP_PORT:-587}
+      SMTP_USER:          ${SMTP_USER:-}
+      SMTP_PASSWORD:      ${SMTP_PASSWORD:-}
+      NOTIFY_EMAIL_TO:    ${NOTIFY_EMAIL_TO:-}
+      TZ:                 ${TZ:-UTC}
+
+    volumes:
+      - ./backups:/backups
+
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+    networks:
+      - bw-backup-net
+
+    labels:
+      ofelia.enabled: "true"
+      ofelia.job-run.bw-backup.schedule:  ${BACKUP_SCHEDULE:-0 2 * * *}
+      ofelia.job-run.bw-backup.container: bitwarden-kdbx-backup-dev
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    container_name: bitwarden-kdbx-backup-scheduler-dev
+    restart: unless-stopped
+    depends_on:
+      - bw-backup
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - bw-backup-net
+    command: daemon --docker
+
+networks:
+  bw-backup-net:
+    driver: bridge
