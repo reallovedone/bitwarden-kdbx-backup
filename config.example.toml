@@ -1,0 +1,43 @@
+# Bitwarden KeePass Backup — configuration file
+# Copy to ./config/config.toml and fill in your values.
+# Alternatively, use the setup wizard at http://localhost:8080
+#
+# All values can be overridden by environment variables (see README).
+
+[bitwarden]
+url             = "https://vault.example.com"
+client_id       = "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+client_secret   = ""
+master_password = ""
+
+[keepass]
+password   = ""
+output_dir = "/backups"
+
+[schedule]
+# Cron expression — https://crontab.guru
+# Examples:
+#   "0 2 * * *"    daily at 02:00 (default)
+#   "0 */6 * * *"  every 6 hours
+#   "30 3 * * 1"   every Monday at 03:30
+cron     = "0 2 * * *"
+timezone = "UTC"
+
+[notify]
+# Comma-separated or list — Apprise URLs: https://github.com/caronc/apprise/wiki
+# Examples:
+#   "tgram://BOT_TOKEN/CHAT_ID"
+#   "discord://WEBHOOK_ID/WEBHOOK_TOKEN"
+#   "ntfy://hostname/topic"
+#   "mailto://user:password@gmail.com"
+urls = []
+
+[retention]
+# Number of .kdbx backups to keep locally. Oldest are deleted after each run.
+# Set to 0 to keep all backups (no rotation).
+keep = 7
+
+[webdav]
+# Include credentials in URL: https://user:apptoken@host/path/
+# Leave empty to disable remote upload.
+url = ""

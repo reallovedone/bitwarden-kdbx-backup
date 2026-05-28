@@ -4,6 +4,9 @@
 # Backup output files
 backups/
 
+# Config files
+config/*
+
 # Python
 __pycache__/
 *.py[cod]

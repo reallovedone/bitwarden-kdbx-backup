@@ -1,3 +1,6 @@
+apprise>=1.9.0
+croniter>=3.0.0
 pykeepass>=4.1.0
 requests==2.32.3
 setuptools>=69.0
+tzdata>=2024.1

@@ -1,29 +1,20 @@
-# Manual one-time run:  docker compose run --rm bw-backup
-# Scheduled:            docker compose up -d ofelia
+# Start:      docker compose up -d
+# One-shot:   docker compose run --rm bw-backup --run-now
+# Dry run:    docker compose run --rm bw-backup --dry-run
+# Setup UI:   http://localhost:8080  (always available when container is running)
 
 services:
 
   bw-backup:
-    image: ghcr.io/reallovedone/bitwarden-kdbx-backup:latest
+    image: ghcr.io/reallovedone/bitwarden-kdbx-backup:1.0.1
     container_name: bitwarden-kdbx-backup
-    restart: "no"
+    restart: unless-stopped
 
-    environment:
-      BW_URL:             ${BW_URL}
-      BW_CLIENTID:        ${BW_CLIENTID}
-      BW_CLIENTSECRET:    ${BW_CLIENTSECRET}
-      BW_MASTER_PASSWORD: ${BW_MASTER_PASSWORD}
-      KEEPASS_PASSWORD:   ${KEEPASS_PASSWORD}
-      BACKUP_OUTPUT_DIR:  ${BACKUP_OUTPUT_DIR:-/backups}
-      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
-      SMTP_HOST:          ${SMTP_HOST:-}
-      SMTP_PORT:          ${SMTP_PORT:-587}
-      SMTP_USER:          ${SMTP_USER:-}
-      SMTP_PASSWORD:      ${SMTP_PASSWORD:-}
-      NOTIFY_EMAIL_TO:    ${NOTIFY_EMAIL_TO:-}
-      TZ:                 ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:8080:8080"  # localhost only — do NOT expose to internet (plain HTTP)
 
     volumes:
+      - ./config:/config
       - ./backups:/backups
 
     deploy:
@@ -32,25 +23,8 @@ services:
           memory: 256M
 
     networks:
-      - bw-backup-net
-
-    labels:
-      ofelia.enabled: "true"
-      ofelia.job-run.bw-backup.schedule:  ${BACKUP_SCHEDULE:-0 2 * * *}
-      ofelia.job-run.bw-backup.container: bitwarden-kdbx-backup
-
-  ofelia:
-    image: mcuadros/ofelia:latest
-    container_name: bitwarden-kdbx-backup-scheduler
-    restart: unless-stopped
-    depends_on:
-      - bw-backup
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - bw-backup-net
-    command: daemon --docker
+      - bw-net
 
 networks:
-  bw-backup-net:
+  bw-net:
     driver: bridge

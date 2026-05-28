@@ -1,7 +1,9 @@
-# Development compose — builds the image locally instead of pulling from ghcr.io
+# Development — builds image locally
 #
-# Manual run:  docker compose -f docker-compose.dev.yml run --rm bw-backup
-# Build only:  docker compose -f docker-compose.dev.yml build
+# Build:     docker compose -f docker-compose.dev.yml build
+# Start:     docker compose -f docker-compose.dev.yml up
+# Dry run:    docker compose -f docker-compose.dev.yml run --rm bw-backup --dry-run
+# Setup UI:   http://localhost:8080  (always available when container is running)
 
 services:
 
@@ -10,28 +12,25 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        BW_CLI_VERSION: "2026.1.0"
+        BW_CLI_VERSION: "2026.4.2"
+        # Set BW_CLI_SHA256 to the sha256 of bw-linux-2026.1.0.zip from the GitHub release page.
+        # Leave empty to skip verification (not recommended for production builds).
+        BW_CLI_SHA256: "431dbe784cc7de217cb3a826993eac451aa2fbaf336538c0ff6602c1ac884c91"
     image: bitwarden-kdbx-backup:dev
     container_name: bitwarden-kdbx-backup-dev
-    restart: "no"
+    restart: unless-stopped
 
-    environment:
-      BW_URL:             ${BW_URL}
-      BW_CLIENTID:        ${BW_CLIENTID}
-      BW_CLIENTSECRET:    ${BW_CLIENTSECRET}
-      BW_MASTER_PASSWORD: ${BW_MASTER_PASSWORD}
-      KEEPASS_PASSWORD:   ${KEEPASS_PASSWORD}
-      BACKUP_OUTPUT_DIR:  ${BACKUP_OUTPUT_DIR:-/backups}
-      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
-      SMTP_HOST:          ${SMTP_HOST:-}
-      SMTP_PORT:          ${SMTP_PORT:-587}
-      SMTP_USER:          ${SMTP_USER:-}
-      SMTP_PASSWORD:      ${SMTP_PASSWORD:-}
-      NOTIFY_EMAIL_TO:    ${NOTIFY_EMAIL_TO:-}
-      TZ:                 ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:8080:8080"
 
     volumes:
+      - ./config:/config
       - ./backups:/backups
+      # Uncomment for live code reload during development:
+      # - ./bitwarden_backup.py:/app/bitwarden_backup.py
+      # - ./daemon.py:/app/daemon.py
+      # - ./setup_server.py:/app/setup_server.py
+      # - ./config.py:/app/config.py
 
     deploy:
       resources:
@@ -39,25 +38,8 @@ services:
           memory: 256M
 
     networks:
-      - bw-backup-net
-
-    labels:
-      ofelia.enabled: "true"
-      ofelia.job-run.bw-backup.schedule:  ${BACKUP_SCHEDULE:-0 2 * * *}
-      ofelia.job-run.bw-backup.container: bitwarden-kdbx-backup-dev
-
-  ofelia:
-    image: mcuadros/ofelia:latest
-    container_name: bitwarden-kdbx-backup-scheduler-dev
-    restart: unless-stopped
-    depends_on:
-      - bw-backup
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - bw-backup-net
-    command: daemon --docker
+      - bw-net
 
 networks:
-  bw-backup-net:
+  bw-net:
     driver: bridge

@@ -1,222 +1,155 @@
 #!/usr/bin/env python3
 """
-bitwarden_backup.py
--------------------
-Exports the personal vault and all organizations from Bitwarden / Vaultwarden
-and saves everything to a KeePass file (.kdbx).
-
-Authentication: API Key (client_id + client_secret)
-Notifications:  webhook (e.g. Slack, Gotify, ntfy) or SMTP email
-
-Required environment variables (.env or systemd EnvironmentFile):
-    BW_CLIENTID          → API key client_id
-    BW_CLIENTSECRET      → API key client_secret
-    BW_MASTER_PASSWORD   → master password (required to unlock after API key login)
-    BW_URL               → URL of your Bitwarden / Vaultwarden instance (e.g. https://vault.example.com)
-    KEEPASS_PASSWORD     → master password for the generated .kdbx file
-    BACKUP_OUTPUT_DIR    → directory where the .kdbx file will be saved (default: /backups)
-
-Optional variables for webhook notifications (Slack / ntfy / Gotify / generic):
-    NOTIFY_WEBHOOK_URL   → webhook URL (leave empty to disable)
-
-Optional variables for SMTP email notifications:
-    SMTP_HOST            → e.g. smtp.gmail.com
-    SMTP_PORT            → e.g. 587
-    SMTP_USER            → sender address
-    SMTP_PASSWORD        → SMTP password / app password
-    NOTIFY_EMAIL_TO      → notification recipient
+Bitwarden → KeePass backup logic.
+Public entry point: run_backup(cfg: dict, dry_run: bool = False) -> int
+All functions accept the cfg dict produced by config.load().
 """
 
-import argparse
-import os
-import sys
 import json
-import subprocess
 import logging
-import smtplib
-import tempfile
-import requests
+import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from urllib.parse import urlparse, urlunparse
 
+import apprise as apprise_lib
+import requests
 from pykeepass import PyKeePass, create_database
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Configuration from environment variables
-# ---------------------------------------------------------------------------
-def require_env(name: str) -> str:
-    val = os.environ.get(name, "").strip()
-    if not val:
-        log.error(f"Missing required environment variable: {name}")
-        sys.exit(1)
-    return val
-
-
-BW_CLIENTID        = require_env("BW_CLIENTID")
-BW_CLIENTSECRET    = require_env("BW_CLIENTSECRET")
-BW_MASTER_PASSWORD = require_env("BW_MASTER_PASSWORD")
-BW_URL             = require_env("BW_URL").rstrip("/")
-KEEPASS_PASSWORD   = require_env("KEEPASS_PASSWORD")
-BACKUP_OUTPUT_DIR  = Path(os.environ.get("BACKUP_OUTPUT_DIR", "/backups"))
-
-NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
-SMTP_HOST          = os.environ.get("SMTP_HOST", "").strip()
-SMTP_PORT          = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER          = os.environ.get("SMTP_USER", "").strip()
-SMTP_PASSWORD      = os.environ.get("SMTP_PASSWORD", "").strip()
-NOTIFY_EMAIL_TO    = os.environ.get("NOTIFY_EMAIL_TO", "").strip()
+_FIELD_HIDDEN = 1
 
 
 # ---------------------------------------------------------------------------
-# Helper: run bw CLI command
+# Bitwarden CLI helpers
 # ---------------------------------------------------------------------------
-def _sanitize_args(args: list[str]) -> list[str]:
-    """Redact sensitive values (session tokens) from argument list for safe logging."""
-    result = []
-    redact_next = False
-    for arg in args:
-        if redact_next:
-            result.append("[REDACTED]")
-            redact_next = False
-        elif arg == "--session":
-            result.append(arg)
-            redact_next = True
-        else:
-            result.append(arg)
-    return result
 
-
-def bw(args: list[str], input_text: str | None = None, capture: bool = True) -> str:
-    """Run the Bitwarden CLI with the given arguments."""
+def _bw_env(cfg: dict) -> dict:
+    """Build subprocess environment with Bitwarden credentials injected."""
     env = os.environ.copy()
-    env["BW_CLIENTID"]     = BW_CLIENTID
-    env["BW_CLIENTSECRET"] = BW_CLIENTSECRET
+    bw  = cfg["bitwarden"]
+    env["BW_CLIENTID"]      = bw["client_id"]
+    env["BW_CLIENTSECRET"]  = bw["client_secret"]
+    env["BW_MASTER_PASSWORD"] = bw["master_password"]
+    return env
 
-    cmd = ["bw", "--nointeraction"] + args
+
+def _redact_session(args: list[str]) -> list[str]:
+    """Replace the value after --session with [REDACTED] for safe logging."""
+    out, hide_next = [], False
+    for arg in args:
+        if hide_next:
+            out.append("[REDACTED]")
+            hide_next = False
+        elif arg == "--session":
+            out.append(arg)
+            hide_next = True
+        else:
+            out.append(arg)
+    return out
+
+
+def _bw(args: list[str], cfg: dict) -> str:
+    """Run a bw CLI command and return stdout. Raises RuntimeError on failure."""
     result = subprocess.run(
-        cmd,
-        input=input_text,
-        capture_output=capture,
+        ["bw", "--nointeraction"] + args,
+        capture_output=True,
         text=True,
-        env=env,
+        env=_bw_env(cfg),
     )
     if result.returncode != 0:
-        safe_args = " ".join(_sanitize_args(args))
-        raise RuntimeError(
-            f"bw {safe_args} failed (exit {result.returncode}):\n{result.stderr}"
-        )
-    return result.stdout.strip() if capture else ""
+        safe = " ".join(_redact_session(args))
+        raise RuntimeError(f"bw {safe} failed (exit {result.returncode}):\n{result.stderr}")
+    return result.stdout.strip()
+
+
+def _bw_json(args: list[str], cfg: dict) -> dict | list:
+    """Run a bw CLI command and parse its JSON output."""
+    return json.loads(_bw(args, cfg))
 
 
 # ---------------------------------------------------------------------------
-# Auth & session
+# Auth
 # ---------------------------------------------------------------------------
-def login_and_unlock() -> str:
-    """Log in with API key and unlock the vault. Returns the BW_SESSION token."""
+
+def _login_and_unlock(cfg: dict) -> str:
+    """Log in with API key and unlock the vault. Returns the session token."""
     log.info("Logging in with API key...")
-    bw(["config", "server", BW_URL])
-    bw(["login", "--apikey"])
-
+    _bw(["config", "server", cfg["bitwarden"]["url"].rstrip("/")], cfg)
+    _bw(["login", "--apikey"], cfg)
     log.info("Unlocking vault...")
-    session = bw(["unlock", "--passwordenv", "BW_MASTER_PASSWORD", "--raw"])
-    log.info("Vault unlocked successfully.")
+    session = _bw(["unlock", "--passwordenv", "BW_MASTER_PASSWORD", "--raw"], cfg)
+    log.info("Vault unlocked.")
     return session
 
 
-def logout():
+def _logout(cfg: dict) -> None:
     try:
-        bw(["logout"])
+        _bw(["logout"], cfg)
         log.info("Logged out.")
     except Exception as e:
         log.warning(f"Logout failed (ignored): {e}")
 
 
 # ---------------------------------------------------------------------------
-# Vault and organization export
+# Vault export
 # ---------------------------------------------------------------------------
-def export_vault(session: str) -> dict:
-    """Export the personal vault as JSON."""
+
+def _export_vault(session: str, cfg: dict) -> dict:
     log.info("Exporting personal vault...")
-    raw = bw(["export", "--session", session, "--format", "json", "--raw"])
-    return json.loads(raw)
+    return _bw_json(["export", "--session", session, "--format", "json", "--raw"], cfg)
 
 
-def list_organizations(session: str) -> list[dict]:
-    """Return the list of organizations."""
-    log.info("Fetching organization list...")
-    raw = bw(["list", "organizations", "--session", session])
-    return json.loads(raw)
+def _list_organizations(session: str, cfg: dict) -> list[dict]:
+    log.info("Fetching organizations...")
+    return _bw_json(["list", "organizations", "--session", session], cfg)
 
 
-def export_organization(session: str, org_id: str, org_name: str) -> dict:
-    """Export an organization as JSON."""
-    log.info(f"Exporting organization: {org_name} ({org_id})")
-    raw = bw(
-        ["export", "--session", session, "--format", "json",
-         "--organizationid", org_id, "--raw"]
+def _export_organization(session: str, org_id: str, org_name: str, cfg: dict) -> dict:
+    log.info(f"Exporting organization: {org_name}")
+    return _bw_json(
+        ["export", "--session", session, "--format", "json", "--organizationid", org_id, "--raw"],
+        cfg,
     )
-    return json.loads(raw)
 
 
-def list_collections(session: str, org_id: str) -> list[dict]:
-    """Return the collections for an organization."""
-    raw = bw(["list", "collections", "--organizationid", org_id, "--session", session])
-    return json.loads(raw)
+def _list_collections(session: str, org_id: str, cfg: dict) -> list[dict]:
+    return _bw_json(["list", "collections", "--organizationid", org_id, "--session", session], cfg)
 
 
 # ---------------------------------------------------------------------------
-# Bitwarden item type mapping
+# KeePass builder
 # ---------------------------------------------------------------------------
-ITEM_TYPE = {1: "login", 2: "secure_note", 3: "card", 4: "identity"}
 
-# Bitwarden custom field types
-FIELD_TYPE_HIDDEN = 1
-
-
-def item_to_keepass_entry(kp: PyKeePass, group, item: dict):
-    """Add a Bitwarden item as a KeePass entry in the specified group."""
-    name     = item.get("name") or "Untitled"
-    notes    = item.get("notes") or ""
-    itype    = item.get("type", 1)
-    username = ""
-    password = ""
-    url      = ""
+def _item_to_entry(kp: PyKeePass, group, item: dict) -> None:
+    name  = item.get("name") or "Untitled"
+    notes = item.get("notes") or ""
+    itype = item.get("type", 1)
+    username = password = url = ""
 
     if itype == 1:  # Login
-        login = item.get("login") or {}
+        login    = item.get("login") or {}
         username = login.get("username") or ""
         password = login.get("password") or ""
         uris     = login.get("uris") or []
-        if uris:
-            url = uris[0].get("uri") or ""
+        url      = uris[0].get("uri") or "" if uris else ""
 
     elif itype == 3:  # Card
-        card = item.get("card") or {}
+        card     = item.get("card") or {}
         username = card.get("cardholderName") or ""
         password = card.get("number") or ""
         notes = (
-            f"Brand: {card.get('brand','')}\n"
-            f"Exp: {card.get('expMonth','')}/{card.get('expYear','')}\n"
-            f"CVV: {card.get('code','')}\n\n"
+            f"Brand: {card.get('brand', '')}\n"
+            f"Exp: {card.get('expMonth', '')}/{card.get('expYear', '')}\n"
+            f"CVV: {card.get('code', '')}\n\n"
         ) + notes
 
     elif itype == 4:  # Identity
         identity = item.get("identity") or {}
-        username = f"{identity.get('firstName','')} {identity.get('lastName','')}".strip()
-        notes = json.dumps(identity, ensure_ascii=False, indent=2) + "\n\n" + notes
+        username = f"{identity.get('firstName', '')} {identity.get('lastName', '')}".strip()
+        notes    = json.dumps(identity, ensure_ascii=False, indent=2) + "\n\n" + notes
 
     entry = kp.add_entry(
         destination_group=group,
@@ -224,250 +157,225 @@ def item_to_keepass_entry(kp: PyKeePass, group, item: dict):
         username=username,
         password=password,
         url=url,
-        notes=f"{notes}".strip(),
+        notes=notes.strip(),
     )
-
-    # Custom fields — hidden fields are marked as protected in KeePass
     for field in item.get("fields") or []:
-        fname   = field.get("name") or "field"
-        fval    = field.get("value") or ""
-        ftype   = field.get("type", 0)
-        protect = ftype == FIELD_TYPE_HIDDEN
-        entry.set_custom_property(fname, fval, protect=protect)
-
-    return entry
+        entry.set_custom_property(
+            field.get("name") or "field",
+            field.get("value") or "",
+            protect=field.get("type", 0) == _FIELD_HIDDEN,
+        )
 
 
-# ---------------------------------------------------------------------------
-# KeePass group helpers
-# ---------------------------------------------------------------------------
-def _ensure_group_path(kp: PyKeePass, parent, path: str):
-    """
-    Navigate or create nested KeePass groups following a slash-delimited path.
-    Example: "Work/Office/VMS" → Personal > Work > Office > VMS
-    """
-    parts = [p.strip() for p in path.split("/") if p.strip()]
+def _ensure_group(kp: PyKeePass, parent, path: str):
+    """Navigate or create nested KeePass groups from a slash-delimited path."""
     current = parent
-    for part in parts:
-        child = next((g for g in current.subgroups if g.name == part), None)
-        if child is None:
-            child = kp.add_group(current, part)
-        current = child
+    for part in (p.strip() for p in path.split("/") if p.strip()):
+        child   = next((g for g in current.subgroups if g.name == part), None)
+        current = child if child else kp.add_group(current, part)
     return current
 
 
-# ---------------------------------------------------------------------------
-# Build KeePass database
-# ---------------------------------------------------------------------------
-def _populate_groups(
-    kp: PyKeePass,
-    parent,
-    items: list[dict] | None,
-    get_id,
-    id_to_name: dict[str, str],
-    fallback_label: str,
-) -> tuple[int, int]:
+def _populate_group(kp, parent, items, get_id, id_to_name, fallback_label) -> tuple[int, int]:
     """
-    Add items to subgroups of *parent*, grouped by a category ID.
-      - get_id(item)  → category id string, or None
-      - id_to_name    → maps id → slash-delimited path (supports nesting)
-      - fallback_label → name of the catch-all group for uncategorised items
+    Add items to sub-groups of parent, grouped by category ID.
     Returns (entry_count, named_group_count).
     """
-    group_cache: dict[str, object] = {}
+    group_cache: dict = {}
     fallback = None
-    count = 0
+    count    = 0
+
     for item in items or []:
         gid = get_id(item)
         if gid and gid in id_to_name:
             if gid not in group_cache:
-                group_cache[gid] = _ensure_group_path(kp, parent, id_to_name[gid])
+                group_cache[gid] = _ensure_group(kp, parent, id_to_name[gid])
             group = group_cache[gid]
         else:
             if fallback is None:
                 fallback = kp.add_group(parent, fallback_label)
             group = fallback
-        item_to_keepass_entry(kp, group, item)
+
+        _item_to_entry(kp, group, item)
         count += 1
+
     return count, len(group_cache)
 
 
-def build_keepass(
-    personal_vault: dict,
-    organizations: list[tuple[str, dict, list[dict]]],
-    output_path: Path,
-) -> int:
-    """
-    Create the .kdbx file mirroring the Bitwarden structure:
-    - Personal/
-        - <Folder name>/   (one subgroup per Bitwarden folder)
-        - No Folder/       (items without a folder)
-    - Org: <OrgName>/
-        - <Collection name>/  (one subgroup per collection)
-        - No Collection/      (items without a collection)
-    Returns the total number of entries inserted.
-    """
-    log.info(f"Creating KeePass database: {output_path}")
-    kp = create_database(str(output_path), password=KEEPASS_PASSWORD)
+def _build_keepass(personal: dict, organizations: list, output: Path, cfg: dict) -> int:
+    """Create the .kdbx file. Returns total number of entries written."""
+    log.info(f"Creating KeePass database: {output}")
+    old_umask = os.umask(0o177)  # ensure kdbx is created 0600 from the start
+    try:
+        kp = create_database(str(output), password=cfg["keepass"]["password"])
+    finally:
+        os.umask(old_umask)
     total = 0
 
-    # --- Personal vault ---
+    # Personal vault
     personal_group = kp.add_group(kp.root_group, "Personal")
-    folders: dict[str, str] = {
-        f["id"]: f["name"]
-        for f in personal_vault.get("folders") or []
-        if f.get("id")
-    }
-    count, nfolders = _populate_groups(
-        kp, personal_group,
-        personal_vault.get("items"),
-        lambda item: item.get("folderId"),
-        folders,
-        "No Folder",
+    folders        = {f["id"]: f["name"] for f in personal.get("folders") or [] if f.get("id")}
+    count, nf      = _populate_group(
+        kp, personal_group, personal.get("items"),
+        lambda i: i.get("folderId"), folders, "No Folder",
     )
     total += count
-    log.info(f"  Personal: {count} entries across {nfolders} folder(s)")
+    log.info(f"  Personal: {count} entries, {nf} folder(s)")
 
-    # --- Organizations ---
+    # Organizations
     for org_name, org_data, collections in organizations:
-        safe_name = org_name or "Unknown Organization"
-        org_group = kp.add_group(kp.root_group, f"Org: {safe_name}")
-        col_map: dict[str, str] = {c["id"]: c["name"] for c in collections if c.get("id")}
-        count, ncols = _populate_groups(
-            kp, org_group,
-            org_data.get("items"),
-            lambda item: (item.get("collectionIds") or [None])[0],
-            col_map,
-            "No Collection",
+        label   = org_name or "Unknown Organization"
+        og      = kp.add_group(kp.root_group, f"Org: {label}")
+        col_map = {c["id"]: c["name"] for c in collections if c.get("id")}
+        count, nc = _populate_group(
+            kp, og, org_data.get("items"),
+            lambda i: (i.get("collectionIds") or [None])[0],
+            col_map, "No Collection",
         )
         total += count
-        log.info(f"  {safe_name}: {count} entries across {ncols} collection(s)")
+        log.info(f"  {label}: {count} entries, {nc} collection(s)")
 
     kp.save()
+    os.chmod(str(output), 0o600)
     log.info(f"Database saved. Total entries: {total}")
     return total
 
 
 # ---------------------------------------------------------------------------
+# Backup rotation
+# ---------------------------------------------------------------------------
+
+def _rotate_backups(out_dir: Path, cfg: dict) -> None:
+    """Delete oldest .kdbx files, keeping only the last N."""
+    keep = int(cfg.get("retention", {}).get("keep", 7))
+    if keep <= 0:
+        return
+    files     = sorted(out_dir.glob("bitwarden_*.kdbx"), key=lambda p: p.name)
+    to_delete = files[:-keep] if len(files) > keep else []
+    for f in to_delete:
+        try:
+            f.unlink()
+            log.info(f"Rotation: removed {f.name}")
+        except Exception as e:
+            log.warning(f"Rotation: could not remove {f.name}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# WebDAV upload
+# ---------------------------------------------------------------------------
+
+def _parse_webdav_url(raw: str) -> tuple[str, tuple[str, str] | None]:
+    """
+    Split credentials from a WebDAV URL.
+    Returns (clean_url, (user, password)) or (url, None) if no credentials.
+    """
+    if not raw:
+        return "", None
+    p = urlparse(raw)
+    if p.username:
+        netloc    = p.hostname + (f":{p.port}" if p.port else "")
+        clean_url = urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+        return (clean_url.rstrip("/") + "/"), (p.username, p.password or "")
+    return (raw.rstrip("/") + "/"), None
+
+
+def _upload_webdav(path: Path, cfg: dict) -> bool:
+    """Upload path to the configured WebDAV folder. Returns True on success."""
+    url, auth = _parse_webdav_url(cfg["webdav"]["url"])
+    if not url:
+        return False
+    dest = url + path.name
+    log.info(f"Uploading to WebDAV: {dest}")
+    try:
+        with path.open("rb") as fh:
+            r = requests.put(
+                dest, data=fh, auth=auth,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=120,
+            )
+        r.raise_for_status()
+        log.info(f"WebDAV upload complete (HTTP {r.status_code}).")
+        return True
+    except Exception as e:
+        log.warning(f"WebDAV upload failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------
-def notify_webhook(success: bool, message: str):
-    if not NOTIFY_WEBHOOK_URL:
+
+def notify(cfg: dict, success: bool, message: str) -> None:
+    """Send success/failure notification via configured Apprise URLs."""
+    urls = cfg.get("notify", {}).get("urls", [])
+    if not urls:
         return
-    icon   = "✅" if success else "❌"
-    status = "SUCCESS" if success else "FAILED"
-    payload = {"text": f"{icon} *Bitwarden Backup {status}*\n{message}"}
-    try:
-        r = requests.post(NOTIFY_WEBHOOK_URL, json=payload, timeout=10)
-        r.raise_for_status()
-        log.info("Webhook notification sent.")
-    except Exception as e:
-        log.warning(f"Webhook notification failed: {e}")
-
-
-def notify_email(success: bool, message: str):
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, NOTIFY_EMAIL_TO]):
-        return
-    status  = "SUCCESS" if success else "FAILED"
-    subject = f"[Bitwarden Backup] {status} — {datetime.now().strftime('%Y-%m-%d')}"
-    msg = MIMEMultipart()
-    msg["From"]    = SMTP_USER
-    msg["To"]      = NOTIFY_EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(message, "plain"))
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_USER, NOTIFY_EMAIL_TO, msg.as_string())
-        log.info("Email notification sent.")
-    except Exception as e:
-        log.warning(f"Email notification failed: {e}")
-
-
-def notify(success: bool, message: str):
-    notify_webhook(success, message)
-    notify_email(success, message)
+    a = apprise_lib.Apprise()
+    for u in urls:
+        a.add(u)
+    title = f"Bitwarden Backup {'SUCCESS' if success else 'FAILED'}"
+    ntype = apprise_lib.NotifyType.SUCCESS if success else apprise_lib.NotifyType.FAILURE
+    a.notify(title=title, body=message, notify_type=ntype)
+    log.info(f"Notification sent to {len(urls)} target(s).")
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Public entry point
 # ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Bitwarden → KeePass backup")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Fetch and count vault items without writing the .kdbx file",
-    )
-    args = parser.parse_args()
 
-    start = datetime.now()
-    timestamp = start.strftime("%Y%m%d_%H%M%S")
-    BACKUP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = BACKUP_OUTPUT_DIR / f"bitwarden_{timestamp}.kdbx"
+def run_backup(cfg: dict, dry_run: bool = False) -> int:
+    """
+    Run a full Bitwarden → KeePass backup.
+    Returns total entry count. Raises on failure.
+    """
+    start     = datetime.now()
+    out_dir   = Path(cfg["keepass"]["output_dir"])
+    output    = out_dir / f"bitwarden_{start.strftime('%Y%m%d_%H%M%S')}.kdbx"
 
-    if args.dry_run:
+    if dry_run:
         log.info("*** DRY RUN — no file will be written ***")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     session = None
     try:
-        session = login_and_unlock()
+        session   = _login_and_unlock(cfg)
+        personal  = _export_vault(session, cfg)
+        orgs_meta = _list_organizations(session, cfg)
 
-        # Export personal vault
-        personal_vault = export_vault(session)
-        personal_count = len(personal_vault.get("items") or [])
+        organizations = [
+            (org["name"],
+             _export_organization(session, org["id"], org["name"], cfg),
+             _list_collections(session, org["id"], cfg))
+            for org in orgs_meta
+        ]
 
-        # Export organizations
-        orgs_meta = list_organizations(session)
-        organizations = []
-        for org in orgs_meta:
-            org_data = export_organization(session, org["id"], org["name"])
-            collections = list_collections(session, org["id"])
-            organizations.append((org["name"], org_data, collections))
-
-        if args.dry_run:
-            total_entries = personal_count + sum(
-                len(data.get("items") or []) for _, data, _ in organizations
+        if dry_run:
+            total = len(personal.get("items") or []) + sum(
+                len(d.get("items") or []) for _, d, _ in organizations
             )
-            personal_folders = len(personal_vault.get("folders") or [])
-            log.info(f"  Personal: {personal_count} entries, {personal_folders} folder(s)")
-            for org_name, org_data, cols in organizations:
-                count = len(org_data.get("items") or [])
-                log.info(f"  {org_name}: {count} entries, {len(cols)} collection(s)")
-            log.info(f"Dry run complete. Would export {total_entries} entries total.")
-            return
+            log.info(f"Dry run complete. Would export {total} entries.")
+            return total
 
-        # Build KeePass database
-        total_entries = build_keepass(personal_vault, organizations, output_path)
+        total     = _build_keepass(personal, organizations, output, cfg)
+        webdav_ok = _upload_webdav(output, cfg)
+        _rotate_backups(out_dir, cfg)
+        elapsed   = int((datetime.now() - start).total_seconds())
 
-        elapsed = (datetime.now() - start).seconds
-        msg = (
-            f"Backup completed in {elapsed}s.\n"
-            f"File: {output_path}\n"
-            f"Organizations: {len(organizations)}\n"
-            f"Total entries: {total_entries}"
-        )
+        msg = "\n".join([
+            f"Backup completed in {elapsed}s.",
+            f"File: {output}",
+            f"Organizations: {len(organizations)}",
+            f"Total entries: {total}",
+        ])
+        if webdav_ok:
+            url, _ = _parse_webdav_url(cfg["webdav"]["url"])
+            msg += f"\nWebDAV: uploaded to {url}{output.name}"
+
         log.info(msg)
-        notify(True, msg)
-
-    except Exception as e:
-        msg = f"Backup FAILED: {e}"
-        log.error(msg, exc_info=True)
-        notify(False, msg)
-        sys.exit(1)
+        notify(cfg, True, msg)
+        return total
 
     finally:
         if session:
-            logout()
-        # Remove any temporary bw files from the system temp directory
-        for f in Path(tempfile.gettempdir()).glob("bw-*"):
-            try:
-                f.unlink()
-            except Exception as e:
-                log.warning(f"Failed to remove temp file {f}: {e}")
-
-
-if __name__ == "__main__":
-    main()
+            _logout(cfg)
