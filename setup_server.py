@@ -65,6 +65,9 @@ button:hover{opacity:.85;}
 p{color:#888;margin-top:.5rem;}
 a{color:var(--accent);}"""
 
+# CSS braces conflict with str.format() — escape them for templates that call .format()
+_STYLE_FMT = _STYLE.replace("{", "{{").replace("}", "}}")
+
 _HTML_FORM = f"""\
 <!DOCTYPE html>
 <html lang="en">
@@ -72,7 +75,7 @@ _HTML_FORM = f"""\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bitwarden KeePass Backup — Setup</title>
-<style>{_STYLE}</style>
+<style>{_STYLE_FMT}</style>
 </head>
 <body>
 <h1>&#9881; Bitwarden KeePass Backup</h1>
@@ -157,7 +160,7 @@ _HTML_FORM = f"""\
   <div class="field">
     <label>WebDAV URL</label>
     <input name="WEBDAV_URL" type="password"
-           placeholder="https://user:apptoken@nextcloud.example.com/remote.php/dav/files/user/Backups/">
+           placeholder="{{WEBDAV_PLACEHOLDER}}">
     <span class="hint">Include credentials in URL — never pre-filled. Leave blank to keep current or skip remote upload.</span>
   </div>
 
@@ -171,7 +174,7 @@ _HTML_OK = f"""\
 <html lang="en">
 <head><meta charset="utf-8"><title>Saved</title>
 <meta http-equiv="refresh" content="3;url=/?token={{TOKEN}}">
-<style>{_STYLE}</style></head>
+<style>{_STYLE_FMT}</style></head>
 <body><div class="box">
 <h2 style="color:var(--green)">&#10003; Saved</h2>
 <p>Configuration written to <code>config.toml</code>.</p>
@@ -183,7 +186,7 @@ _HTML_ERR = f"""\
 <!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Error</title>
-<style>{_STYLE}</style></head>
+<style>{_STYLE_FMT}</style></head>
 <body><div class="box">
 <h2 style="color:#e55">&#10007; {{TITLE}}</h2>
 <p>{{DETAIL}}</p>
@@ -208,6 +211,7 @@ _HTML_403 = f"""\
 _FORM_DEFAULTS = {
     "BW_URL": "", "BW_CLIENTID": "", "BACKUP_SCHEDULE": "0 2 * * *",
     "TZ": "UTC", "NOTIFY_URLS": "", "BACKUP_KEEP": "7",
+    "WEBDAV_PLACEHOLDER": "https://user:apptoken@nextcloud.example.com/remote.php/dav/files/user/Backups/",
 }
 
 
@@ -219,14 +223,17 @@ def _read_form_values() -> dict:
         with open(_config_path, "rb") as f:
             cfg = tomllib.load(f)
         bw, sc, no, rt = (cfg.get(s, {}) for s in ("bitwarden", "schedule", "notify", "retention"))
+        webdav_set = bool(cfg.get("webdav", {}).get("url", "").strip())
         return {
-            "BW_URL":          html.escape(bw.get("url", "")),
-            "BW_CLIENTID":     html.escape(bw.get("client_id", "")),
-            "BACKUP_SCHEDULE": html.escape(sc.get("cron", "0 2 * * *")),
-            "TZ":              html.escape(sc.get("timezone", "UTC")),
-            "NOTIFY_URLS":     html.escape("\n".join(no.get("urls", []))),
-            "BACKUP_KEEP":     html.escape(str(rt.get("keep", 7))),
+            "BW_URL":             html.escape(bw.get("url", "")),
+            "BW_CLIENTID":        html.escape(bw.get("client_id", "")),
+            "BACKUP_SCHEDULE":    html.escape(sc.get("cron", "0 2 * * *")),
+            "TZ":                 html.escape(sc.get("timezone", "UTC")),
+            "NOTIFY_URLS":        html.escape("\n".join(no.get("urls", []))),
+            "BACKUP_KEEP":        html.escape(str(rt.get("keep", 7))),
             # WEBDAV_URL omitted — contains embedded credentials
+            "WEBDAV_PLACEHOLDER": "leave blank to keep current" if webdav_set
+                                  else "https://user:apptoken@nextcloud.example.com/remote.php/dav/files/user/Backups/",
         }
     except Exception:
         return {}
