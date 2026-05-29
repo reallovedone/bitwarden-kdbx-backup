@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxml2 \
         ca-certificates \
         tzdata \
+        gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=bw-downloader /usr/local/bin/bw /usr/local/bin/bw
@@ -37,15 +38,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bitwarden_backup.py config.py daemon.py setup_server.py ./
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-RUN mkdir -p /backups /config && chown appuser:appuser /backups /config
+RUN mkdir -p /backups /config
 
 ENV BACKUP_OUTPUT_DIR=/backups \
     CONFIG_PATH=/config/config.toml \
     SETUP_PORT=8080
 
-USER appuser
-
 EXPOSE 8080
 
-ENTRYPOINT ["python", "daemon.py"]
+# Runs as root — entrypoint fixes volume permissions then drops to appuser via gosu
+ENTRYPOINT ["/entrypoint.sh"]
